@@ -50,6 +50,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 	body = filteredBody
 	clearGrokResponsesClientToolMapping(c)
+	c.Set(nativeCodexImageBridgeKey, nil)
 	clearOpenAIResponsesClientToolMapping(c)
 	clearOpenAIResponsesNamespaceNames(c)
 	setCodexToolNameReverse(c, nil)
@@ -90,6 +91,16 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 		c.Header("X-Codex2API-Upstream", "codex")
 		c.Header("X-Codex2API-Basispoints-Bypass", reason)
+	}
+
+	nativeBody, nativeImages, nativeImageErr := s.prepareNativeCodexImageBridge(ctx, c, account, body, wsExecutionScope)
+	if nativeImageErr != nil {
+		return nil, nativeImageErr
+	}
+	body = nativeBody
+	if nativeImages != nil {
+		defer nativeImages.cancel()
+		defer func() { nativeImages.state.apply(result) }()
 	}
 
 	if account.IsOpenAIOAuthLike() {
@@ -410,6 +421,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		imageGenerationAllowed = GroupAllowsImageGeneration(apiKey.Group)
 	}
 	codexImageGenerationBridgeEnabled := isCodexCLI &&
+		nativeImages == nil &&
 		!isOpenAIResponsesLiteHeader(c.GetHeader(responsesLiteHeader)) &&
 		imageGenerationAllowed &&
 		codexImageGenerationExplicitToolPolicy != codexImageGenerationExplicitToolPolicyStrip &&
@@ -1294,6 +1306,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			return s.handleErrorResponse(ctx, resp, c, account, body, resolveOpenAIErrorSchedulingModel(billingModel, upstreamModel))
 		}
 		defer func() { _ = resp.Body.Close() }()
+		if err := applyNativeCodexImageResponse(ctx, c, resp); err != nil {
+			return nil, err
+		}
 
 		if mapping, ok := openAIResponsesClientToolMapping(c); ok && isEventStreamResponse(resp.Header) {
 			maxLineSize := defaultMaxLineSize
