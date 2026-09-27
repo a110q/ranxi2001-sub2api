@@ -800,6 +800,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			parseOpenAIWSResponseUsageFromCompletedEvent(upstreamMessage, &usage)
 		}
 		if eventType == "error" || eventType == "response.failed" {
+			logExcelBPSImageUpstreamFailure(ctx, eventType, upstreamMessage)
 			markOpenAICyberPolicyEvent(c, upstreamMessage, http.StatusOK, &usage)
 		}
 		imageCounter.AddSSEData(upstreamMessage)

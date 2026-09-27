@@ -214,7 +214,8 @@ func TestExcelBPSAutomaticImageGenerationFailureIsDiagnosed(t *testing.T) {
 	account.Extra[featureKeyCodexImageGenerationBridge] = true
 	result, err := svc.Forward(c.Request.Context(), c, account, []byte(`{"model":"gpt-6-astra","input":"draw a cat","stream":true}`))
 	require.Error(t, err)
-	require.Equal(t, "response.failed", result.UpstreamTerminalEvent)
+	require.NotNil(t, result)
+	require.Contains(t, rec.Body.String(), "event: response.failed")
 	require.Contains(t, rec.Body.String(), "basispoints_image_generation_failed")
 	require.Len(t, upstream.requests, 2)
 
@@ -222,7 +223,13 @@ func TestExcelBPSAutomaticImageGenerationFailureIsDiagnosed(t *testing.T) {
 	require.Len(t, entries, 1)
 	fields := entries[0].ContextMap()
 	require.Equal(t, "req-image-failed", fields["request_id"])
-	require.Equal(t, "response.failed", fields["terminal_event"])
-	require.Equal(t, "image_generation_failed", fields["upstream_error_code"])
+	require.Equal(t, "missing_terminal", fields["reason"])
+	upstreamEntries := logs.FilterMessage("excel_bps.native_image_upstream_failed").All()
+	require.Len(t, upstreamEntries, 1)
+	upstreamFields := upstreamEntries[0].ContextMap()
+	require.Equal(t, "response.failed", upstreamFields["terminal_event"])
+	require.Equal(t, "failed", upstreamFields["response_status"])
+	require.Equal(t, "image_generation_failed", upstreamFields["upstream_error_code"])
 	require.NotContains(t, fmt.Sprint(fields), "private-image-secret")
+	require.NotContains(t, fmt.Sprint(upstreamFields), "private-image-secret")
 }

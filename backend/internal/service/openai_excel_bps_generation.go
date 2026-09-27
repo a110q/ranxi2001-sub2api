@@ -21,6 +21,7 @@ import (
 )
 
 type excelBPSImageSlotKey struct{}
+type excelBPSImageDiagnosticKey struct{}
 
 // WithExcelBPSImageSlotAcquirer defers the existing handler image limit until
 // the model actually selects the server-owned tool. Ordinary chat holds no slot.
@@ -56,6 +57,7 @@ func (s *OpenAIGatewayService) excelBPSImageGenerator(ctx context.Context, c *gi
 	return func(request basispoints.ImageGenerationRequest) (basispoints.ImageGenerationResult, error) {
 		started := time.Now()
 		imageCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
+		imageCtx = context.WithValue(imageCtx, excelBPSImageDiagnosticKey{}, account.ID)
 		defer cancel()
 		if err := imageCtx.Err(); err != nil {
 			return basispoints.ImageGenerationResult{}, err
@@ -187,6 +189,31 @@ func logExcelBPSImageFailure(ctx context.Context, accountID int64, reason string
 		zap.Int("response_bytes", recorder.Body.Len()),
 		zap.Int("output_items", len(output)),
 		zap.Int64("duration_ms", time.Since(started).Milliseconds()),
+	)
+}
+
+// Observe the upstream terminal before the gateway can suppress it for failover.
+// Only fixed metadata labels leave this function; the error message and payload do not.
+func logExcelBPSImageUpstreamFailure(ctx context.Context, event string, payload []byte) {
+	accountID, ok := ctx.Value(excelBPSImageDiagnosticKey{}).(int64)
+	if !ok || (event != "response.failed" && event != "error") {
+		return
+	}
+	errorPath := "response.error"
+	if !gjson.GetBytes(payload, errorPath).Exists() {
+		errorPath = "error"
+	}
+	field := func(name string) string {
+		return gjson.GetBytes(payload, errorPath+"."+name).String()
+	}
+	logger.FromContext(ctx).Warn("excel_bps.native_image_upstream_failed",
+		zap.Int64("account_id", accountID),
+		zap.String("terminal_event", excelBPSImageDiagnosticEvent(event)),
+		zap.String("response_status", excelBPSImageDiagnosticStatus(gjson.GetBytes(payload, "response.status").String())),
+		zap.String("upstream_error_code", excelBPSImageDiagnosticCode(field("code"))),
+		zap.String("upstream_error_type", excelBPSImageDiagnosticType(field("type"))),
+		zap.String("upstream_error_param", excelBPSImageDiagnosticParam(field("param"))),
+		zap.Int("event_bytes", len(payload)),
 	)
 }
 
