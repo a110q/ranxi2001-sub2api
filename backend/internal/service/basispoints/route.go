@@ -13,11 +13,20 @@ func NativeFallbackReason(body []byte) string {
 	if !gjson.ValidBytes(body) {
 		return ""
 	}
-	if tools := gjson.GetBytes(body, "tools"); tools.IsArray() {
+	var inspectTools func(gjson.Result) string
+	inspectTools = func(tools gjson.Result) string {
+		if !tools.IsArray() {
+			return ""
+		}
 		fallback := ""
 		tools.ForEach(func(_, tool gjson.Result) bool {
 			kind := strings.ToLower(strings.TrimSpace(tool.Get("type").String()))
 			switch kind {
+			case "namespace":
+				fallback = inspectTools(tool.Get("tools"))
+				if fallback != "" {
+					return false
+				}
 			case "image_generation":
 				fallback = "image_generation"
 				return false
@@ -29,12 +38,35 @@ func NativeFallbackReason(body []byte) string {
 			}
 			return true
 		})
+		return fallback
+	}
+	if reason := inspectTools(gjson.GetBytes(body, "tools")); reason != "" {
+		return reason
+	}
+	// Responses Lite may carry declarations in input.additional_tools. Prepare
+	// collects those declarations too, so route hosted tools before it filters
+	// capabilities that BPS cannot execute. Passive client image_gen functions
+	// remain ordinary BPS tools.
+	if input := gjson.GetBytes(body, "input"); input.IsArray() {
+		fallback := ""
+		input.ForEach(func(_, item gjson.Result) bool {
+			if item.Get("type").String() == "additional_tools" {
+				fallback = inspectTools(item.Get("tools"))
+			}
+			return fallback == ""
+		})
 		if fallback != "" {
 			return fallback
 		}
 	}
 	choice := gjson.GetBytes(body, "tool_choice")
 	if choice.Exists() && choice.Type == gjson.JSON {
+		if strings.EqualFold(choice.Get("type").String(), "image_generation") {
+			return "image_generation"
+		}
+		if reason := inspectTools(choice.Get("tools")); reason != "" {
+			return reason
+		}
 		name := choice.Get("name").String()
 		if strings.Contains(strings.ToLower(name), "web_search") || strings.Contains(strings.ToLower(name), "image_generation") {
 			return "tool_choice"

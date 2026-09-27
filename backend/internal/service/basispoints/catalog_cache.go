@@ -94,15 +94,20 @@ func (c *CatalogCache) commit(scope string, expected uint64, raw []byte) bool {
 }
 
 func PrepareWithCatalog(raw []byte, scope string, replay *ReplayCache, cache *CatalogCache) ([]byte, *Bridge, error) {
+	return PrepareWithCatalogAndImageGeneration(raw, scope, replay, cache, nil)
+}
+
+// Keep client catalog caching independent of the per-request server image tool.
+func PrepareWithCatalogAndImageGeneration(raw []byte, scope string, replay *ReplayCache, cache *CatalogCache, generate ImageGenerator) ([]byte, *Bridge, error) {
 	if cache == nil || scope == "" {
-		return Prepare(raw, scope, replay)
+		return prepare(raw, scope, replay, generate)
 	}
 	var source object
 	if decode(raw, &source) != nil || source == nil {
 		return nil, nil, fmt.Errorf("invalid Basispoints request JSON")
 	}
 	if text(source["tool_choice"]) == "none" {
-		return Prepare(raw, scope, replay)
+		return prepare(raw, scope, replay, generate)
 	}
 	_, explicit := source["tools"]
 	for attempt := 0; attempt < 8; attempt++ {
@@ -122,12 +127,15 @@ func PrepareWithCatalog(raw []byte, scope string, replay *ReplayCache, cache *Ca
 		if err != nil {
 			return nil, nil, err
 		}
-		body, b, err := Prepare(encoded, scope, replay)
+		body, b, err := prepare(encoded, scope, replay, generate)
 		if err != nil {
 			return nil, nil, err
 		}
 		keys := make([]string, 0, len(b.tools))
 		for key := range b.tools {
+			if b.imageGenerator != nil && key == ImageGenerationToolName {
+				continue
+			}
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
@@ -170,6 +178,9 @@ func (b *Bridge) Reprepare(raw []byte) ([]byte, *Bridge, error) {
 	if _, explicit := source["tools"]; !explicit {
 		keys := make([]string, 0, len(b.tools))
 		for key := range b.tools {
+			if b.imageGenerator != nil && key == ImageGenerationToolName {
+				continue
+			}
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
@@ -188,5 +199,5 @@ func (b *Bridge) Reprepare(raw []byte) ([]byte, *Bridge, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	return Prepare(encoded, b.scope, b.replay)
+	return prepare(encoded, b.scope, b.replay, b.imageGenerator)
 }

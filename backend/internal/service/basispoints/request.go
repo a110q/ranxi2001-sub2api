@@ -17,17 +17,21 @@ const ResponsesURL = "https://bps.openai.com/basispoints/api/responses"
 type object = map[string]any
 
 type Bridge struct {
-	RequestedEffort  string
-	Effort           string
-	Warnings         []string
-	tools            map[string]tool
-	unsupportedTools map[string]bool
-	structured       *structuredOutput
-	replay           *ReplayCache
-	scope            string
-	stagedReplays    *[]replayWrite
-	hasToolHistory   bool
-	disallowParallel bool
+	RequestedEffort   string
+	Effort            string
+	Warnings          []string
+	tools             map[string]tool
+	unsupportedTools  map[string]bool
+	structured        *structuredOutput
+	imageGenerator    ImageGenerator
+	imageRenderer     *tool
+	imageFileDelivery bool
+	imageFiles        []string
+	replay            *ReplayCache
+	scope             string
+	stagedReplays     *[]replayWrite
+	hasToolHistory    bool
+	disallowParallel  bool
 }
 
 func decode(raw []byte, target any) error {
@@ -71,11 +75,25 @@ func fingerprint(value any) string {
 }
 
 func message(role, content string) object {
-	return object{"type": "message", "role": role, "content": []any{object{"type": "input_text", "text": content}}}
+	kind := "input_text"
+	if role == "assistant" {
+		kind = "output_text"
+	}
+	return object{"type": "message", "role": role, "content": []any{object{"type": kind, "text": content}}}
 }
 
 // Prepare preserves the requested model and uses a whitelist for the Excel wire body.
 func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, error) {
+	return prepare(raw, scope, replay, nil)
+}
+
+// PrepareWithImageGeneration adds one proxy-owned tool, without adding a hosted
+// image tool to every upstream request or changing ordinary BPS routing.
+func PrepareWithImageGeneration(raw []byte, scope string, replay *ReplayCache, generate ImageGenerator) ([]byte, *Bridge, error) {
+	return prepare(raw, scope, replay, generate)
+}
+
+func prepare(raw []byte, scope string, replay *ReplayCache, generate ImageGenerator) ([]byte, *Bridge, error) {
 	var source object
 	if err := decode(raw, &source); err != nil || source == nil {
 		return nil, nil, fmt.Errorf("invalid Basispoints request JSON")
@@ -141,6 +159,9 @@ func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, er
 			}
 		}
 	}
+	if generate != nil && text(choice) != "none" && structured == nil {
+		catalog = b.addImageGenerationTool(catalog, generate)
+	}
 	var input []any
 	switch v := source["input"].(type) {
 	case string:
@@ -150,6 +171,7 @@ func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, er
 	default:
 		return nil, nil, fmt.Errorf("basispoints input must be text or a Responses item array")
 	}
+	b.collectImageFileReceipts(input)
 	translated, err := b.translateHistory(input)
 	if err != nil {
 		return nil, nil, err
@@ -175,6 +197,12 @@ func Prepare(raw []byte, scope string, replay *ReplayCache) ([]byte, *Bridge, er
 			"Do not call other native tools or claim that shell, filesystem or workspace access is unavailable when a suitable catalog tool exists. " +
 			"If no tool is needed, answer as assistant text. Client tool catalog:\n" + describeCatalog(catalog) +
 			"\nEnd of catalog. Invoke native run_officejs once. Follow each tool's specified transport: FUNCTION uses a JSON envelope; FUNCTION_CODE uses raw code plus metadata JSON in extended_summary; FUNCTION_CMD uses raw cmd plus metadata JSON; CUSTOM uses its exact marker and raw input. No Office code is executed by the proxy."
+	}
+	if b.imageGenerator != nil {
+		protocol += imageGenerationInstructions
+		if b.imageFileDelivery {
+			protocol += imageFileDeliveryHint
+		}
 	}
 	if len(b.unsupportedTools) > 0 {
 		kinds := make([]string, 0, len(b.unsupportedTools))

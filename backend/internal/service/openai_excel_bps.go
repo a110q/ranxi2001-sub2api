@@ -164,7 +164,7 @@ func newExcelBPSRequest(ctx context.Context, body []byte, token, accountID strin
 
 // BPS deliberately bypasses Codex ticket/cookie injection and OAuth plugins:
 // only the selected account's bearer and ChatGPT account ID belong on this host.
-func (s *OpenAIGatewayService) forwardExcelBPS(ctx context.Context, c *gin.Context, account *Account, body []byte, start time.Time) (*OpenAIForwardResult, error) {
+func (s *OpenAIGatewayService) forwardExcelBPS(ctx context.Context, c *gin.Context, account *Account, body []byte, start time.Time) (result *OpenAIForwardResult, returnErr error) {
 	fail := func(status int, code, message string) (*OpenAIForwardResult, error) {
 		// A compact keepalive may already have committed SSE headers. Otherwise
 		// finish a single JSON response so the handler cannot append another error.
@@ -226,13 +226,13 @@ func (s *OpenAIGatewayService) forwardExcelBPS(ctx context.Context, c *gin.Conte
 		return fail(503, "basispoints_image_settings_unavailable", "Excel BPS image settings are unavailable")
 	}
 	var images *basispoints.NativeImages
+	var relay *basispoints.ImageRelay
 	if imageSettings.Enabled && imageSettings.Mode == ExcelBPSImageModeNative {
 		images, err = basispoints.PrepareNativeImagesWithLimit(body, imageSettings.Limits.MaxImages)
 		if err == nil {
 			body, err = images.Body()
 		}
 	} else {
-		var relay *basispoints.ImageRelay
 		relay, err = s.excelBPSImageRelayForSettings(imageSettings)
 		if err != nil {
 			return fail(503, "basispoints_image_relay_unavailable", "Excel BPS image relay is unavailable")
@@ -255,7 +255,16 @@ func (s *OpenAIGatewayService) forwardExcelBPS(ctx context.Context, c *gin.Conte
 	if identity != "" {
 		replay, catalog = &excelBPSReplay, &excelBPSCatalog
 	}
-	upstreamBody, bridge, err := basispoints.PrepareWithCatalog(body, scope, replay, catalog)
+	if os.Getenv("EXCEL_BPS_IMAGE_PREWARM") == "true" {
+		if err := relay.Prewarm(ctx, body); err != nil {
+			return fail(503, "basispoints_image_prewarm_unavailable", basispoints.ErrImageRelayPrewarm.Error())
+		}
+	}
+	imageCtx, cancelImages := context.WithCancel(ctx)
+	defer cancelImages()
+	imageState := &excelBPSImageGenerationState{}
+	generate := s.excelBPSImageGenerator(imageCtx, c, account, originalModel, imageState)
+	upstreamBody, bridge, err := basispoints.PrepareWithCatalogAndImageGeneration(body, scope, replay, catalog, generate)
 	if err != nil {
 		return fail(400, "basispoints_request_invalid", err.Error())
 	}
@@ -496,8 +505,25 @@ func (s *OpenAIGatewayService) forwardExcelBPS(ctx context.Context, c *gin.Conte
 	// The bridge sees the body after group policy mapping. Keep the original
 	// client effort for usage display, and the BPS-normalized effort for billing.
 	requestedEffort := coalesceRequestedReasoningEffort(RequestedReasoningEffortFromContext(ctx), &bridge.RequestedEffort)
-	result := &OpenAIForwardResult{Model: originalModel, UpstreamModel: model, UpstreamEndpoint: "/basispoints/api/responses", Stream: stream, ReasoningEffort: &bridge.Effort, RequestedReasoningEffort: requestedEffort, RequestID: resp.Header.Get("x-request-id")}
+	result = &OpenAIForwardResult{Model: originalModel, UpstreamModel: model, UpstreamEndpoint: "/basispoints/api/responses", Stream: stream, ReasoningEffort: &bridge.Effort, RequestedReasoningEffort: requestedEffort, RequestID: resp.Header.Get("x-request-id")}
+	defer imageState.apply(result)
 	if stream {
+		finish, compressionErr := startExcelBPSStreamCompression(c)
+		if compressionErr != nil {
+			return fail(500, "basispoints_compression_unavailable", "Could not initialize response encoding")
+		}
+		defer func() {
+			closeErr := finish()
+			if result != nil {
+				result.Duration = time.Since(start)
+				if closeErr != nil {
+					result.ClientDisconnect = true
+				}
+			}
+			if returnErr == nil {
+				returnErr = closeErr
+			}
+		}()
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("X-Accel-Buffering", "no")

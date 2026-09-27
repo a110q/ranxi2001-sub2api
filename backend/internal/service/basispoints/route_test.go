@@ -9,6 +9,15 @@ func TestNativeFallbackReason(t *testing.T) {
 		{`{"tools":[{"type":"image_generation"}]}`, "image_generation"},
 		{`{"tools":[{"type":"web_search","external_web_access":true}]}`, "web_search"},
 		{`{"tools":[{"type":"function","name":"exec"}]}`, ""},
+		{`{"input":[{"type":"additional_tools","tools":[{"type":"image_generation"}]}]}`, "image_generation"},
+		{`{"input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"images","tools":[{"type":"image_generation"}]}]}]}`, "image_generation"},
+		{`{"tool_choice":{"type":"image_generation"}}`, "image_generation"},
+		{`{"tool_choice":{"type":"allowed_tools","mode":"required","tools":[{"type":"image_generation"}]}}`, "image_generation"},
+		{`{"tools":[{"type":"namespace","name":"image_gen","tools":[{"type":"function","name":"imagegen"}]}],"tool_choice":"auto"}`, ""},
+		{`{"input":[{"type":"additional_tools","tools":[{"type":"namespace","name":"image_gen","tools":[{"type":"function","name":"imagegen"}]}]}]}`, ""},
+		{`{"input":[{"role":"user","content":"explain image_generation tools"}]}`, ""},
+		{`{"tools":[{"type":"custom","name":"image_gen.imagegen"}]}`, ""},
+		{`{"input":"draw a kitten"}`, ""},
 	}
 	for _, tc := range cases {
 		if got := NativeFallbackReason([]byte(tc.body)); got != tc.want {
