@@ -9,10 +9,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/service/basispoints"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func excelImageToolResponse(t *testing.T, selected bool) *http.Response {
@@ -165,4 +169,60 @@ func TestExcelBPSImageRecorderIsBounded(t *testing.T) {
 	require.Zero(t, n)
 	require.Zero(t, w.Body.Len())
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
+}
+
+func TestExcelBPSImageFailureDiagnosticsAreCredentialFree(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	ctx := logger.IntoContext(context.Background(), zap.New(core).With(zap.String("request_id", "req-image-43885")))
+	w := &excelBPSImageRecorder{ResponseRecorder: httptest.NewRecorder(), cancel: func() {}}
+	w.WriteHeader(http.StatusTooManyRequests)
+	_, err := w.Write([]byte(`{"error":{"code":"insufficient_quota","message":"private-image-secret"}}`))
+	require.NoError(t, err)
+	response := map[string]any{"status": "failed", "error": map[string]any{"code": "insufficient_quota", "type": "invalid_request_error", "param": "tools[0].size", "message": "private-image-secret"}}
+	logExcelBPSImageFailure(ctx, 2, "http_status", w, nil, fmt.Errorf("proxy-password=private-image-secret"), nil, "response.failed", response, time.Now())
+
+	entries := logs.FilterMessage("excel_bps.native_image_child_failed").All()
+	require.Len(t, entries, 1)
+	fields := entries[0].ContextMap()
+	require.Equal(t, "req-image-43885", fields["request_id"])
+	require.Equal(t, "http_status", fields["reason"])
+	require.Equal(t, int64(http.StatusTooManyRequests), fields["http_status"])
+	require.Equal(t, "response.failed", fields["terminal_event"])
+	require.Equal(t, "insufficient_quota", fields["upstream_error_code"])
+	require.Equal(t, "invalid_request_error", fields["upstream_error_type"])
+	require.Equal(t, "tools[0].size", fields["upstream_error_param"])
+	require.NotContains(t, fmt.Sprint(fields), "private-image-secret")
+	require.Equal(t, "other", excelBPSImageDiagnosticCode("sk-private-image-secret"))
+	require.Equal(t, "other", excelBPSImageDiagnosticType("private-image-secret"))
+	require.Equal(t, "other", excelBPSImageDiagnosticParam("private-image-secret"))
+}
+
+func TestExcelBPSAutomaticImageGenerationFailureIsDiagnosed(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	ctx := logger.IntoContext(context.Background(), zap.New(core).With(zap.String("request_id", "req-image-failed")))
+	failed := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"image_generation_failed\",\"message\":\"private-image-secret\"}}}\n\n")),
+	}
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{excelImageToolResponse(t, true), failed}}
+	svc := newOpenAIImageGenerationControlTestService(upstream)
+	c, rec := newOpenAIImageGenerationControlTestContext(true, "codex_cli_rs/0.98.0")
+	c.Request = c.Request.WithContext(WithExcelBPSImageSlotAcquirer(ctx, func(context.Context) (func(), bool) { return func() {}, true }))
+	account := excelImageAccount()
+	account.Extra[featureKeyCodexImageGenerationBridge] = true
+	result, err := svc.Forward(c.Request.Context(), c, account, []byte(`{"model":"gpt-6-astra","input":"draw a cat","stream":true}`))
+	require.Error(t, err)
+	require.Equal(t, "response.failed", result.UpstreamTerminalEvent)
+	require.Contains(t, rec.Body.String(), "basispoints_image_generation_failed")
+	require.Len(t, upstream.requests, 2)
+
+	entries := logs.FilterMessage("excel_bps.native_image_child_failed").All()
+	require.Len(t, entries, 1)
+	fields := entries[0].ContextMap()
+	require.Equal(t, "req-image-failed", fields["request_id"])
+	require.Equal(t, "response.failed", fields["terminal_event"])
+	require.Equal(t, "image_generation_failed", fields["upstream_error_code"])
+	require.NotContains(t, fmt.Sprint(fields), "private-image-secret")
 }
